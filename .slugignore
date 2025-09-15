@@ -1,0 +1,23 @@
+# Exclude files from the Heroku slug (keeps slug small)
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# Logs and local artifacts
+logs/
+*.log
+Informacion_mercado/
+analisis_financiero_consolidado.md
+
+# Local env
+.env
+
+# Dev/editor files
+.vscode/
+.idea/
+
+# Project-specific
+chat.py

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and artifacts
+logs/
+*.log
+
+# Local env files
+.env
+
+# Project-specific
+chat.py
+Informacion_mercado/
+analisis_financiero_consolidado.md
+
