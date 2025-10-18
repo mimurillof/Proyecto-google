@@ -1,14 +1,25 @@
-# Proyecto de Análisis Financiero y Videos de YouTube
+# Proyecto de Análisis Financiero Multi-Cliente
 
-Este proyecto es una suite completa de herramientas para el análisis financiero automatizado que combina múltiples APIs para obtener datos de mercado, analizar videos de YouTube con contenido financiero, y generar informes detallados.
+Sistema escalable de análisis financiero que procesa portfolios dinámicos de múltiples clientes desde Supabase, generando informes personalizados organizados por cliente.
 
 ## 📋 Descripción General
 
 El proyecto consta de tres componentes principales:
 
-1. **Análisis de Videos de YouTube** (`api_youtube.py`) - Busca y analiza videos financieros de pre-mercado usando IA
-2. **Análisis Financiero Automatizado** (`financial_api.py`) - Recopila datos financieros de múltiples fuentes y genera informes
+1. **Análisis de Videos de YouTube** (`api_youtube.py`) - Analiza videos financieros de pre-mercado usando IA
+2. **Análisis Financiero Multi-Cliente** (`financial_api.py`) - Procesa portfolios dinámicos desde Supabase para múltiples clientes
 3. **Asistente Financiero por Chat** (`chat.py`) - Chatbot inteligente para consultas financieras
+4. **Orquestador** (`orchestrator.py`) - Ejecuta los procesos secuencialmente
+
+## ⭐ Novedades v2.1
+
+- ✅ **Normalización Automática de Tickers**: Convierte BTCUSD→BTC-USD, NVD.F→NVDA automáticamente
+- ✅ **Videos en Carpetas de Clientes**: Informes de YouTube se guardan en carpeta de cada cliente
+- ✅ **Sin Archivos Locales**: Todo se guarda directamente en Supabase Storage
+- ✅ **Multi-Cliente Escalable**: Procesa portfolios de N clientes desde Supabase
+- ✅ **Portfolios Dinámicos**: Lee assets desde base de datos (no hardcodeado)
+- ✅ **Almacenamiento por Cliente**: Cada cliente tiene su carpeta `portfolio-files/{user_id}/`
+- ✅ **Modo Demo**: Testing sin base de datos real
 
 ## 🚀 Características Principales
 
@@ -16,9 +27,14 @@ El proyecto consta de tres componentes principales:
 - Búsqueda automática del video más reciente de análisis pre-mercado en canales específicos de YouTube
 - Análisis avanzado del contenido del video usando Google Gemini 2.5-flash
 - Extracción de información financiera clave: tendencias, datos gráficos, noticias relevantes
+- **NUEVO:** Subida automática a carpeta de cada cliente en Supabase Storage
 - Generación de informes estructurados en formato Markdown
 
 ### 📊 Análisis Financiero Integral
+- **NUEVO: Normalización automática de tickers**:
+  - Criptomonedas: `BTCUSD` → `BTC-USD`
+  - Commodities: `PAXGUSD` → `PAXG-USD`
+  - Mercados internacionales: `NVD.F` → `NVDA`
 - **Múltiples fuentes de datos**:
   - Alpha Vantage (precios diarios e intradía)
   - Financial Modeling Prep (estados financieros, perfiles de empresa)
@@ -30,6 +46,7 @@ El proyecto consta de tres componentes principales:
   - Precios históricos e indicadores técnicos
   - Noticias recientes y eventos relevantes
 - **Generación de informes consolidados** para múltiples empresas
+- **Almacenamiento organizado por cliente** en Supabase Storage
 
 ### 🤖 Asistente Financiero Inteligente
 - Chat interactivo con Google Gemini
@@ -42,23 +59,34 @@ El proyecto consta de tres componentes principales:
 ```
 Proyecto google/
 ├── api_youtube.py              # Análisis de videos de YouTube
-├── financial_api.py            # API financiera principal
+├── financial_api.py            # API financiera principal (v2.1)
 ├── chat.py                     # Asistente de chat financiero
+├── orchestrator.py             # Orquestador de procesos
+├── database.py                 # Gestión de base de datos Supabase
+├── storage_manager.py          # Gestión de almacenamiento Supabase
+├── config.py                   # Configuración centralizada
 ├── requirements.txt            # Dependencias del proyecto
-├── Informacion_mercado/        # Informes generados
-│   ├── AAPL_analisis_financiero.md
-│   ├── AMZN_analisis_financiero.md
-│   ├── GOOGL_analisis_financiero.md
-│   ├── MSFT_analisis_financiero.md
-│   ├── TSLA_analisis_financiero.md
-│   └── informe_video.md        # Análisis del video más reciente
+├── logs/                       # Logs de ejecución del orchestrator
+├── MEJORAS_V2.1.md            # Documentación de mejoras v2.1
+├── RESUMEN_CAMBIOS.md         # Resumen de cambios v2.0
 └── README.md                   # Este archivo
+
+Supabase Storage (portfolio-files):
+├── {cliente_id_1}/
+│   ├── NVDA_analisis_financiero.md        # Normalizado de NVD.F
+│   ├── BTC-USD_analisis_financiero.md     # Normalizado de BTCUSD
+│   ├── informe_consolidado.md
+│   └── informe_video_premercado.md
+├── {cliente_id_2}/
+│   └── ...
 ```
 
 ## 🔧 Configuración e Instalación
 
 ### Prerrequisitos
 - Python 3.7 o superior
+- Cuenta de Supabase con tablas `users`, `portfolios`, `assets`
+- Bucket de Supabase Storage: `portfolio-files`
 - Claves API de:
   - Google Cloud (YouTube Data API v3)
   - Google AI Studio (Gemini API)
@@ -120,27 +148,59 @@ python api_youtube.py
 ✅ Análisis guardado en: Informacion_mercado/informe_video.md
 ```
 
-### 2. Análisis Financiero de Empresas
+### 2. Análisis Financiero Multi-Cliente (NUEVO v2.0)
 
+**Opción A: Procesar todos los clientes activos**
 ```bash
 python financial_api.py
 ```
 
+**Opción B: Procesar un cliente específico**
+```bash
+python financial_api.py <user_id>
+```
+
+**Opción C: Modo demo (sin base de datos)**
+```bash
+python financial_api.py --demo
+```
+
 **Funcionalidades:**
-- Análisis automático de múltiples empresas (AAPL, MSFT, GOOGL, AMZN, TSLA)
-- Verificación previa de todas las APIs
-- Generación de informes individuales y consolidados
-- Pausa estratégica entre consultas para respetar límites de API
+- Lee portfolios dinámicamente desde Supabase (tablas: users, portfolios, assets)
+- Procesa múltiples clientes y múltiples portfolios por cliente
+- Genera informes individuales por ticker y consolidados por cliente
+- Guarda archivos organizados: `portfolio-files/{user_id}/`
+- Modo demo para testing sin afectar la base de datos real
 
 **Ejemplo de salida:**
 ```
---- Iniciando verificación previa de APIs ---
+🚀 API FINANCIERA MULTI-CLIENTE - SISTEMA ESCALABLE
+
+============================================================
+VERIFICACIÓN PREVIA DE APIs
+============================================================
 ✅ ESTADO: ÉXITO en Alpha Vantage
 ✅ ESTADO: ÉXITO en Financial Modeling Prep
 ✅ ESTADO: ÉXITO en Finnhub
 
-Procesando datos para AAPL...
-✅ Informe consolidado generado exitosamente en analisis_financiero_consolidado.md
+🌐 Modo: Todos los Clientes Activos
+📊 Total de clientes activos a procesar: 3
+
+🎯 PROCESANDO CLIENTE: Juan Pérez
+📂 Total de Portfolios: 2
+📊 Total de Assets: 8
+🎯 Tickers únicos: 5
+
+[1/5] Procesando AAPL...
+✅ Informe de AAPL guardado exitosamente
+✅ Informe consolidado guardado exitosamente
+```
+
+**Estructura de Base de Datos Requerida:**
+```
+users (user_id, first_name, last_name, email)
+portfolios (portfolio_id, user_id, portfolio_name, description)
+assets (asset_id, portfolio_id, asset_symbol, quantity, acquisition_price)
 ```
 
 ### 3. Asistente Financiero por Chat

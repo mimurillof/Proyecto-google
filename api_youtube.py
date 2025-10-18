@@ -35,6 +35,8 @@ import os
 import io
 import tempfile
 from supabase import create_client, Client
+from database import get_clientes_activos
+from storage_manager import StorageManager
 from config import (
     YOUTUBE_API_KEY, GEMINI_API_KEY, 
     SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE, SUPABASE_BUCKET_NAME, SUPABASE_BASE_PREFIX,
@@ -196,86 +198,39 @@ Omite estrictamente cualquier información no relevante o superflua del video, c
 # --- Supabase helpers ---
 def existe_archivo_en_supabase(nombre_archivo_remoto):
     """
-    Verifica si un archivo existe en el bucket/prefijo configurado.
-
-    Returns:
-        bool: True si existe, False si no existe o en error.
+    DEPRECATED: Esta función ya no se utiliza.
+    Se mantiene por compatibilidad pero no debe usarse.
     """
-    try:
-        supabase_key = SUPABASE_SERVICE_ROLE or SUPABASE_ANON_KEY
-        supabase: Client = create_client(SUPABASE_URL, supabase_key)
-        carpeta = SUPABASE_BASE_PREFIX or ""
-        # Listar en la carpeta (o raíz si vacío) y buscar por nombre
-        if carpeta:
-            items = supabase.storage.from_(SUPABASE_BUCKET_NAME).list(path=carpeta)
-        else:
-            items = supabase.storage.from_(SUPABASE_BUCKET_NAME).list()
-        if not items:
-            return False
-        return any(getattr(it, "name", None) == nombre_archivo_remoto or (isinstance(it, dict) and it.get("name") == nombre_archivo_remoto) for it in items)
-    except Exception:
-        # En caso de duda, retornamos False y dejamos que upsert maneje creación/actualización
-        return False
+    pass
 
-def subir_texto_a_supabase(contenido_texto, nombre_archivo_remoto):
+
+def subir_texto_a_supabase(contenido_texto, nombre_archivo_remoto, cliente_id):
     """
-    Sube contenido de texto directamente (sin crear archivo local) a Supabase Storage
-    utilizando variables de entorno:
-      - SUPABASE_URL
-      - SUPABASE_ANON_KEY
-      - SUPABASE_BUCKET
-      - SUPABASE_FOLDER (opcional)
-
+    Sube contenido de texto a Supabase Storage en la carpeta del cliente.
+    
     Args:
         contenido_texto (str): Contenido a subir en formato texto.
         nombre_archivo_remoto (str): Nombre del archivo remoto (sin carpeta).
+        cliente_id (str): ID del cliente para organización de archivos.
 
     Returns:
         bool: True si subió correctamente, False en caso contrario.
     """
-    supabase_url = SUPABASE_URL
-    supabase_key = SUPABASE_SERVICE_ROLE or SUPABASE_ANON_KEY
-    supabase_bucket = SUPABASE_BUCKET_NAME
-    supabase_folder = SUPABASE_BASE_PREFIX
-
-    if not supabase_url or not supabase_key or not supabase_bucket:
+    try:
+        storage = StorageManager()
+        success = storage.subir_texto(
+            contenido_texto=contenido_texto,
+            nombre_archivo=nombre_archivo_remoto,
+            cliente_id=cliente_id,
+            content_type="text/markdown; charset=utf-8"
+        )
+        return success
+    except Exception as e:
         print("---------------------------------------------------------")
-        print("Faltan configuraciones de Supabase.")
-        print("Verifica tu archivo .env y que contenga todas las variables de Supabase.")
+        print("¡ERROR! No se pudo subir el archivo a Supabase.")
+        print(f"Detalles del error: {e}")
         print("---------------------------------------------------------")
         return False
-
-    try:
-        supabase: Client = create_client(supabase_url, supabase_key)
-        ruta_remota = f"{supabase_folder}/{nombre_archivo_remoto}" if supabase_folder else nombre_archivo_remoto
-
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".md", mode="w", encoding="utf-8") as tmp:
-                tmp.write(contenido_texto)
-                temp_path = tmp.name
-
-            ya_existia = existe_archivo_en_supabase(nombre_archivo_remoto)
-
-            _ = supabase.storage.from_(supabase_bucket).upload(
-                path=ruta_remota,
-                file=temp_path,
-                file_options={
-                    "cacheControl": "3600",
-                    "upsert": "true",
-                    "contentType": "text/markdown; charset=utf-8",
-                },
-            )
-
-            accion = "actualizado" if ya_existia else "creado"
-            print(f"\n✅ Archivo {accion} en Supabase: bucket='{supabase_bucket}', path='{ruta_remota}'")
-            return True
-        finally:
-            if temp_path:
-                try:
-                    os.unlink(temp_path)
-                except Exception:
-                    pass
     except Exception as e:
         print("---------------------------------------------------------")
         print("¡ERROR! No se pudo subir el archivo a Supabase.")
@@ -314,12 +269,46 @@ if url_video_encontrado:
         print("="*60)
         print(analisis_gemini)
 
-        # Subir directamente a Supabase Storage (sin escribir archivo local)
-        print("\nSubiendo informe a Supabase Storage...")
-        nombre_remoto = "informe_video.md"
-        exito = subir_texto_a_supabase(analisis_gemini, nombre_remoto)
-        if not exito:
-            print("No se pudo subir el informe a Supabase. Verifica configuración y permisos.")
+        # Subir el informe a la carpeta de cada cliente activo
+        print("\n" + "="*60)
+        print("SUBIENDO INFORMES A SUPABASE STORAGE")
+        print("="*60)
+        
+        # Obtener todos los clientes activos
+        clientes = get_clientes_activos()
+        
+        if not clientes:
+            print("\n⚠️  No se encontraron clientes activos en la base de datos.")
+            print("El informe no se guardará.")
+        else:
+            print(f"\n📊 Subiendo informe para {len(clientes)} clientes activos...\n")
+            
+            exitosos = 0
+            fallidos = 0
+            nombre_remoto = "informe_video_premercado.md"
+            
+            for idx, cliente in enumerate(clientes, 1):
+                print(f"[{idx}/{len(clientes)}] Subiendo para cliente: {cliente.nombre_completo}...")
+                
+                exito = subir_texto_a_supabase(
+                    contenido_texto=analisis_gemini,
+                    nombre_archivo_remoto=nombre_remoto,
+                    cliente_id=cliente.user_id
+                )
+                
+                if exito:
+                    exitosos += 1
+                    print(f"    ✅ Subido exitosamente a carpeta: {cliente.user_id}/")
+                else:
+                    fallidos += 1
+                    print(f"    ❌ Error al subir para cliente {cliente.user_id}")
+            
+            print("\n" + "="*60)
+            print("RESUMEN DE SUBIDA")
+            print("="*60)
+            print(f"✅ Exitosos: {exitosos}")
+            print(f"❌ Fallidos: {fallidos}")
+            print("="*60)
         
     else:
         print("\nNo se pudo completar el análisis con Gemini. Revisa tu clave API y conexión.")
