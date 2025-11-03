@@ -6,34 +6,41 @@ Módulo principal para análisis financiero dinámico de portfolios de clientes.
 Obtiene los assets de cada cliente desde Supabase y genera informes personalizados.
 """
 
-import requests
-import pandas as pd
-import json
-import yfinance as yf
 import datetime
-import time
 import logging
-from typing import Optional, List, Dict, Any
+import re
+import time
+from typing import Any, Dict, List, Optional
 
-from database import get_clientes_activos, get_cliente_por_id, Cliente
-from storage_manager import subir_informe_cliente, crear_carpeta_cliente
-from config import (
-    ALPHA_VANTAGE_API_KEY, 
-    FMP_API_KEY, 
-    FINNHUB_API_KEY, 
-    DIAS_HISTORICOS
-)
+import pandas as pd
+import yfinance as yf
+
+try:
+    from pandas_datareader import data as pdr  # type: ignore[import]
+    PDR_AVAILABLE = True
+    PDR_IMPORT_ERROR: Optional[Exception] = None
+except Exception as err:  # noqa: BLE001 - queremos capturar cualquier problema de importación
+    pdr = None  # type: ignore[assignment]
+    PDR_AVAILABLE = False
+    PDR_IMPORT_ERROR = err
+
+from database import Cliente, get_cliente_por_id, get_clientes_activos
+from storage_manager import crear_carpeta_cliente, subir_informe_cliente
+from config import DIAS_HISTORICOS
+
+if PDR_AVAILABLE:
+    yf.pdr_override()  # type: ignore[attr-defined]
 
 # Configuración de logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
 
 # --- Configuración Global ---
-print("✅ Claves API financieras cargadas desde .env")
+print("✅ Dependencias financieras inicializadas (yfinance + pandas-datareader)")
 
 # Rango de fechas para datos históricos
 FECHA_FIN = datetime.date.today()
@@ -117,6 +124,7 @@ def normalizar_ticker(ticker: str) -> str:
         'TSLA.F': 'TSLA',
         'META.F': 'META',
         'NFLX.F': 'NFLX',
+        '^SPX': '^GSPC',
     }
     
     # Aplicar normalización en orden de prioridad
@@ -151,294 +159,289 @@ def normalizar_ticker(ticker: str) -> str:
     return ticker
 
 
-# --- Funciones de Acceso a APIs ---
+# --- Utilidades de datos (yfinance / pandas-datareader) ---
 
-def get_alpha_vantage_daily_prices(ticker, api_key, output_size='compact'):
-    """Obtiene datos de precios diarios de Alpha Vantage."""
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={ticker}&outputsize={output_size}&apikey={api_key}"
-    logger.debug(f"Llamando a Alpha Vantage (Daily): {ticker}")
+def sanitizar_nombre_archivo(nombre: str) -> str:
+    """Normaliza un identificador para usarlo como nombre de archivo en Supabase."""
+    seguro = re.sub(r"[^A-Za-z0-9._-]", "-", nombre)
+    seguro = re.sub(r"-+", "-", seguro).strip("-")
+    return seguro or "reporte"
+
+
+def get_yf_ticker(ticker: str) -> Optional[yf.Ticker]:
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if "Time Series (Daily)" in data:
-            df = pd.DataFrame.from_dict(data["Time Series (Daily)"], orient='index')
-            df = df.rename(columns={
-                '1. open': 'Open', '2. high': 'High', '3. low': 'Low',
-                '4. close': 'Close', '5. volume': 'Volume'
-            })
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index(ascending=True)
-            return df
-        else:
-            logger.warning(f"Error o límite alcanzado en Alpha Vantage (Daily) para {ticker}: {data}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error al conectar con Alpha Vantage (Daily) para {ticker}: {e}")
+        return yf.Ticker(ticker)
+    except Exception as err:
+        logger.error(f"Error al instanciar yfinance.Ticker para {ticker}: {err}")
         return None
 
 
-def get_alpha_vantage_intraday_prices(ticker, api_key, interval='5min', output_size='compact'):
-    """Obtiene datos de precios intradía de Alpha Vantage."""
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={ticker}&interval={interval}&outputsize={output_size}&apikey={api_key}"
-    logger.debug(f"Llamando a Alpha Vantage (Intraday): {ticker}")
+def get_yf_profile(ticker_obj: yf.Ticker) -> Optional[Dict[str, Any]]:
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if f"Time Series ({interval})" in data:
-            df = pd.DataFrame.from_dict(data[f"Time Series ({interval})"], orient='index')
-            df = df.rename(columns={
-                '1. open': 'Open', '2. high': 'High', '3. low': 'Low',
-                '4. close': 'Close', '5. volume': 'Volume'
-            })
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index(ascending=True)
-            return df
-        else:
-            logger.warning(f"Error o límite alcanzado en Alpha Vantage (Intraday) para {ticker}: {data}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error al conectar con Alpha Vantage (Intraday) para {ticker}: {e}")
-        return None
+        info = ticker_obj.get_info()
+        if info:
+            return info
+    except Exception as err:
+        logger.warning(f"No se pudo obtener la información general para {ticker_obj.ticker}: {err}")
+    return None
 
 
-def get_fmp_company_profile(ticker, api_key):
-    """Obtiene el perfil general de la empresa de FMP."""
-    url = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={api_key}"
-    logger.debug(f"Llamando a FMP (Profile): {ticker}")
+def _obtener_estado_financiero(ticker_obj: yf.Ticker, attr: str, metodo: str) -> Optional[pd.DataFrame]:
+    for accessor in (attr, metodo):
+        try:
+            valor = getattr(ticker_obj, accessor, None)
+            if valor is None:
+                continue
+            data = valor() if callable(valor) else valor
+            if isinstance(data, pd.DataFrame) and not data.empty:
+                return data
+        except Exception as err:
+            logger.debug(f"Accessor {accessor} no disponible para {ticker_obj.ticker}: {err}")
+    return None
+
+
+def get_yf_financial_statements(ticker_obj: yf.Ticker) -> Dict[str, Optional[pd.DataFrame]]:
+    return {
+        "income": _obtener_estado_financiero(ticker_obj, "income_stmt", "get_income_stmt"),
+        "balance": _obtener_estado_financiero(ticker_obj, "balance_sheet", "get_balance_sheet"),
+        "cashflow": _obtener_estado_financiero(ticker_obj, "cashflow", "get_cashflow"),
+    }
+
+
+def get_yf_daily_prices(ticker: str, start_date: datetime.date, end_date: datetime.date) -> Optional[pd.DataFrame]:
+    logger.debug(f"Descargando histórico diario (yfinance) para {ticker}")
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if data and isinstance(data, list) and data[0]:
-            return data[0]
-        else:
-            logger.warning(f"Error o datos no encontrados en FMP (Profile) para {ticker}: {data}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error al conectar con FMP (Profile) para {ticker}: {e}")
-        return None
-
-
-def get_fmp_financial_statements(ticker, api_key, statement_type, limit=1):
-    """Obtiene estados financieros de FMP."""
-    url = f"https://financialmodelingprep.com/api/v3/{statement_type}/{ticker}?limit={limit}&apikey={api_key}"
-    logger.debug(f"Llamando a FMP ({statement_type}): {ticker}")
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if data and isinstance(data, list):
-            df = pd.DataFrame(data).set_index('date')
-            df = df.sort_index(ascending=True)
-            return df
-        else:
-            logger.warning(f"Error o datos no encontrados en FMP ({statement_type}) para {ticker}: {data}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error al conectar con FMP ({statement_type}) para {ticker}: {e}")
-        return None
-
-
-def get_yfinance_historical_data(ticker, start_date, end_date):
-    """Obtiene datos históricos de precios de Yahoo Finance."""
-    logger.debug(f"Llamando a yfinance para {ticker}")
-    try:
-        data = yf.download(ticker, start=start_date, end=end_date, progress=False)
-        if not data.empty:
+        data = yf.download(ticker, start=start_date, end=end_date + datetime.timedelta(days=1), progress=False)
+        if data is not None and not data.empty:
             return data
+        logger.warning(f"No se encontraron datos diarios en yfinance para {ticker}")
+    except Exception as err:
+        logger.error(f"Error al obtener datos diarios en yfinance para {ticker}: {err}")
+    return None
+
+
+def get_yf_intraday_prices(ticker: str, period: str = "5d", interval: str = "1h") -> Optional[pd.DataFrame]:
+    logger.debug(f"Descargando datos intradía (yfinance) para {ticker}")
+    try:
+        data = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+        if data is not None and not data.empty:
+            return data
+        logger.warning(f"No se encontraron datos intradía en yfinance para {ticker}")
+    except Exception as err:
+        logger.error(f"Error al obtener datos intradía para {ticker}: {err}")
+    return None
+
+
+def get_pdr_daily_prices(ticker: str, start_date: datetime.date, end_date: datetime.date) -> Optional[pd.DataFrame]:
+    logger.debug(f"Descargando histórico diario (pandas-datareader) para {ticker}")
+    if not PDR_AVAILABLE or pdr is None:
+        if PDR_IMPORT_ERROR:
+            logger.warning(
+                "pandas-datareader no disponible: %s", PDR_IMPORT_ERROR
+            )
         else:
-            logger.warning(f"No se encontraron datos históricos de yfinance para {ticker}")
-            return None
-    except Exception as e:
-        logger.error(f"Error al obtener datos de yfinance para {ticker}: {e}")
+            logger.warning("pandas-datareader no está instalado en el entorno actual")
         return None
 
-
-def get_finnhub_quote(ticker, api_key):
-    """Obtiene una cotización simple de Finnhub."""
-    url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={api_key}"
-    logger.debug(f"Verificando Finnhub (Quote): {ticker}")
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if data and 'error' not in data and 'c' in data:
-            return True
-        else:
-            logger.warning(f"Error en la verificación de Finnhub para {ticker}: {data}")
-            return False
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error al conectar con Finnhub (Quote) para {ticker}: {e}")
-        return False
-    except json.JSONDecodeError:
-        logger.error(f"Error al decodificar la respuesta JSON de Finnhub (Quote) para {ticker}")
-        return False
+        df = pdr.get_data_yahoo(ticker, start=start_date, end=end_date + datetime.timedelta(days=1))
+        if df is not None:
+            if isinstance(df, pd.Series):
+                df = df.to_frame(name="value")
+            df = pd.DataFrame(df)
+            if not df.empty:
+                return df
+        logger.warning(f"No se encontraron datos diarios en pandas-datareader para {ticker}")
+    except Exception as err:
+        logger.error(f"Error al obtener datos diarios con pandas-datareader para {ticker}: {err}")
+    return None
 
 
-def get_finnhub_company_news(ticker, api_key, start_date, end_date):
-    """Obtiene noticias de la empresa de Finnhub."""
-    url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={start_date.strftime('%Y-%m-%d')}&to={end_date.strftime('%Y-%m-%d')}&token={api_key}"
-    logger.debug(f"Llamando a Finnhub (Company News): {ticker}")
+def get_yf_news(ticker_obj: yf.Ticker) -> Optional[pd.DataFrame]:
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        if data and isinstance(data, list):
-            df = pd.DataFrame(data)
-            df['datetime'] = pd.to_datetime(df['datetime'], unit='s')
-            df = df.sort_values(by='datetime', ascending=False)
-            return df
-        else:
-            logger.warning(f"No se encontraron noticias de Finnhub para {ticker}")
-            return None
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Error al conectar con Finnhub (Company News) para {ticker}: {e}")
+        news_items = ticker_obj.news
+    except Exception as err:
+        logger.warning(f"No se pudieron obtener noticias para {ticker_obj.ticker}: {err}")
         return None
+
+    if not news_items:
+        logger.info(f"Sin noticias recientes para {ticker_obj.ticker}")
+        return None
+
+    df = pd.DataFrame(news_items)
+    if "providerPublishTime" in df.columns:
+        df["providerPublishTime"] = pd.to_datetime(df["providerPublishTime"], unit="s", errors="coerce")
+        df = df.sort_values(by="providerPublishTime", ascending=False)
+    return df
 
 
 # --- Verificación Previa de APIs ---
 
-def check_api_status(test_ticker: str = 'AAPL') -> bool:
-    """Realiza una verificación rápida en todas las APIs."""
-    print("\n" + "="*60)
-    print("VERIFICACIÓN PREVIA DE APIs")
-    print("="*60)
-    apis_ok = True
+def check_api_status(test_ticker: str = "AAPL") -> bool:
+    """Realiza una verificación rápida utilizando yfinance y pandas-datareader."""
+    print("\n" + "=" * 60)
+    print("VERIFICACIÓN PREVIA DE FUENTES (yfinance / pandas-datareader)")
+    print("=" * 60)
 
-    print("\n🔍 Verificando Alpha Vantage...")
-    av_check = get_alpha_vantage_daily_prices(test_ticker, ALPHA_VANTAGE_API_KEY, output_size='compact')
-    if av_check is None:
-        print("❌ ESTADO: FALLO en Alpha Vantage.")
-        apis_ok = False
+    servicios_ok = True
+
+    print("\n🔍 Verificando yfinance (histórico diario)...")
+    if get_yf_daily_prices(test_ticker, FECHA_INICIO, FECHA_FIN) is None:
+        print("❌ ESTADO: FALLO en yfinance.")
+        servicios_ok = False
     else:
-        print("✅ ESTADO: ÉXITO en Alpha Vantage.")
+        print("✅ ESTADO: ÉXITO en yfinance.")
 
-    print("\n🔍 Verificando Financial Modeling Prep...")
-    fmp_check = get_fmp_company_profile(test_ticker, FMP_API_KEY)
-    if fmp_check is None:
-        print("❌ ESTADO: FALLO en Financial Modeling Prep.")
-        apis_ok = False
+    print("\n🔍 Verificando pandas-datareader (Yahoo Finance)...")
+    if PDR_AVAILABLE and pdr is not None:
+        if get_pdr_daily_prices(test_ticker, FECHA_INICIO, FECHA_FIN) is None:
+            print("❌ ESTADO: FALLO en pandas-datareader.")
+            servicios_ok = False
+        else:
+            print("✅ ESTADO: ÉXITO en pandas-datareader.")
     else:
-        print("✅ ESTADO: ÉXITO en Financial Modeling Prep.")
+        print("⚠️  pandas-datareader no está disponible. Se continuará solo con yfinance.")
 
-    print("\n🔍 Verificando Finnhub...")
-    finnhub_check = get_finnhub_quote(test_ticker, FINNHUB_API_KEY)
-    if not finnhub_check:
-        print("❌ ESTADO: FALLO en Finnhub.")
-        apis_ok = False
-    else:
-        print("✅ ESTADO: ÉXITO en Finnhub.")
-
-    print("\n" + "="*60)
-    if not apis_ok:
-        print("⚠️  ADVERTENCIA: Una o más APIs fallaron la verificación.")
-        print("="*60)
+    print("\n" + "=" * 60)
+    if not servicios_ok:
+        print("⚠️  ADVERTENCIA: Una o más fuentes fallaron la verificación.")
+        print("=" * 60)
         return False
-    
-    print("✅ Todas las APIs están funcionando correctamente.")
-    print("="*60)
+
+    print("✅ Fuentes verificadas correctamente.")
+    print("=" * 60)
     return True
 
 
 # --- Generación de Informes ---
 
-def generate_markdown_report(ticker, profile, daily_prices_av, intraday_prices_av,
-                             income_statement_fmp, balance_sheet_fmp, cash_flow_fmp,
-                             daily_prices_yf, finnhub_news):
+def _formatear_moneda(valor: Any) -> str:
+    if isinstance(valor, (int, float)):
+        return f"${valor:,.2f}"
+    return str(valor) if valor not in (None, "") else "N/A"
+
+
+def _preparar_estado(df: Optional[pd.DataFrame], columnas: List[str]) -> Optional[pd.DataFrame]:
+    if df is None or df.empty:
+        return None
+    preparado = df.transpose()
+    disponibles = [col for col in columnas if col in preparado.columns]
+    if disponibles:
+        return preparado[disponibles]
+    return preparado.iloc[:, : min(6, preparado.shape[1])]
+
+
+def generate_markdown_report(
+    ticker: str,
+    profile: Optional[Dict[str, Any]],
+    income_statement: Optional[pd.DataFrame],
+    balance_sheet: Optional[pd.DataFrame],
+    cash_flow: Optional[pd.DataFrame],
+    daily_prices_yf: Optional[pd.DataFrame],
+    daily_prices_pdr: Optional[pd.DataFrame],
+    intraday_prices_yf: Optional[pd.DataFrame],
+    news_df: Optional[pd.DataFrame],
+) -> str:
     """Genera un informe en formato Markdown con los datos recopilados."""
     report = f"# Análisis Financiero de {ticker}\n\n"
     report += f"Generado el: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     report += "---\n\n"
 
-    # 1. Perfil y Datos Generales (FMP)
-    report += "## 1. Perfil y Datos Generales (FMP)\n"
+    # 1. Perfil y Datos Generales
+    report += "## 1. Perfil y Datos Generales (yfinance)\n"
     if profile:
-        report += f"* **Nombre de la Empresa:** {profile.get('companyName', 'N/A')}\n"
-        report += f"* **Símbolo:** {profile.get('symbol', 'N/A')}\n"
+        report += f"* **Nombre de la Empresa:** {profile.get('longName') or profile.get('shortName') or 'N/A'}\n"
+        report += f"* **Símbolo:** {profile.get('symbol') or ticker}\n"
         report += f"* **Sector:** {profile.get('sector', 'N/A')}\n"
         report += f"* **Industria:** {profile.get('industry', 'N/A')}\n"
-        report += f"* **Capitalización de Mercado:** ${profile.get('mktCap', 'N/A'):,.2f}\n"
+        report += f"* **Capitalización de Mercado:** {_formatear_moneda(profile.get('marketCap'))}\n"
         report += f"* **Moneda:** {profile.get('currency', 'N/A')}\n"
-        report += f"* **Último Precio de Cierre (FMP):** ${profile.get('price', 'N/A')}\n"
-        report += f"* **Descripción:** {profile.get('description', 'N/A')[:500]}...\n"
+        precio_cierre = profile.get('currentPrice') or profile.get('previousClose')
+        report += f"* **Último Precio de Cierre (yfinance):** {_formatear_moneda(precio_cierre)}\n"
+        descripcion = profile.get('longBusinessSummary')
+        if descripcion:
+            report += f"* **Descripción:** {descripcion[:500]}...\n"
     else:
-        report += "No se pudo obtener el perfil de la empresa.\n"
+        report += "No se pudo obtener el perfil de la empresa desde yfinance.\n"
     report += "\n"
 
-    # 2. Datos Fundamentales Clave (FMP)
-    report += "## 2. Datos Fundamentales Clave (FMP - Último Reporte Anual)\n"
+    # 2. Datos Fundamentales Clave
+    report += "## 2. Datos Fundamentales Clave (yfinance)\n"
 
-    # Estado de Resultados
-    if income_statement_fmp is not None and not income_statement_fmp.empty:
+    estado_resultados = _preparar_estado(income_statement, [
+        "Total Revenue",
+        "Cost Of Revenue",
+        "Gross Profit",
+        "Operating Income",
+        "Net Income",
+        "Diluted EPS",
+    ])
+    if estado_resultados is not None:
         report += "### 2.1. Estado de Resultados (Income Statement)\n"
-        desired_cols_is = ['revenue', 'costOfRevenue', 'grossProfit', 'operatingIncome', 'netIncome', 'eps']
-        available_cols_is = [col for col in desired_cols_is if col in income_statement_fmp.columns]
-        if available_cols_is:
-            report += income_statement_fmp[available_cols_is].to_markdown() + "\n\n"
-        else:
-            report += "Columnas esperadas no encontradas. Mostrando primeras 6 columnas disponibles:\n"
-            report += income_statement_fmp.iloc[:, :6].to_markdown() + "\n\n"
+        report += estado_resultados.to_markdown() + "\n\n"
     else:
         report += "No se pudo obtener el Estado de Resultados.\n"
 
-    # Balance General
-    if balance_sheet_fmp is not None and not balance_sheet_fmp.empty:
+    balance_general = _preparar_estado(balance_sheet, [
+        "Cash And Cash Equivalents",
+        "Total Current Assets",
+        "Total Assets",
+        "Total Current Liabilities",
+        "Total Liab",
+        "Total Stockholder Equity",
+    ])
+    if balance_general is not None:
         report += "### 2.2. Balance General (Balance Sheet)\n"
-        desired_cols_bs = ['cashAndCashEquivalents', 'totalCurrentAssets', 'totalAssets', 'totalCurrentLiabilities', 'totalLiabilities', 'totalEquity']
-        available_cols_bs = [col for col in desired_cols_bs if col in balance_sheet_fmp.columns]
-        if available_cols_bs:
-            report += balance_sheet_fmp[available_cols_bs].to_markdown() + "\n\n"
-        else:
-            report += "Columnas esperadas no encontradas. Mostrando primeras 6 columnas disponibles:\n"
-            report += balance_sheet_fmp.iloc[:, :6].to_markdown() + "\n\n"
+        report += balance_general.to_markdown() + "\n\n"
     else:
         report += "No se pudo obtener el Balance General.\n"
 
-    # Flujo de Caja
-    if cash_flow_fmp is not None and not cash_flow_fmp.empty:
+    flujo_caja = _preparar_estado(cash_flow, [
+        "Net Income",
+        "Depreciation",
+        "Change In Working Capital",
+        "Total Cash From Operating Activities",
+        "Capital Expenditures",
+        "Total Cash From Financing Activities",
+    ])
+    if flujo_caja is not None:
         report += "### 2.3. Flujo de Caja (Cash Flow Statement)\n"
-        desired_cols_cf = ['netIncome', 'depreciationAndAmortization', 'changesInWorkingCapital', 'cashFlowFromOperatingActivities', 'capitalExpenditure', 'cashFlowFromFinancingActivities']
-        available_cols_cf = [col for col in desired_cols_cf if col in cash_flow_fmp.columns]
-        if available_cols_cf:
-            report += cash_flow_fmp[available_cols_cf].to_markdown() + "\n\n"
-        else:
-            report += "Columnas esperadas no encontradas. Mostrando primeras 6 columnas disponibles:\n"
-            report += cash_flow_fmp.iloc[:, :6].to_markdown() + "\n\n"
+        report += flujo_caja.to_markdown() + "\n\n"
     else:
         report += "No se pudo obtener el Flujo de Caja.\n"
 
     # 3. Datos Históricos de Precios
     report += "## 3. Datos Históricos de Precios e Indicadores\n"
 
-    if daily_prices_av is not None and not daily_prices_av.empty:
-        report += f"### 3.1. Precios Diarios (Alpha Vantage - Últimos {min(len(daily_prices_av), DIAS_HISTORICOS)} Días)\n"
-        report += daily_prices_av.tail(DIAS_HISTORICOS).to_markdown() + "\n\n"
-    else:
-        report += "No se pudieron obtener los precios diarios de Alpha Vantage.\n"
-
-    if intraday_prices_av is not None and not intraday_prices_av.empty:
-        report += "### 3.2. Precios Intradía (Alpha Vantage - Intervalo de 5min - Últimas 100 barras)\n"
-        report += "_Nota: La disponibilidad de datos de pre-mercado específicos depende del plan y configuración de la API._\n"
-        report += intraday_prices_av.tail(100).to_markdown() + "\n\n"
-    else:
-        report += "No se pudieron obtener los precios intradía de Alpha Vantage.\n"
-
-    if daily_prices_yf is not None and not daily_prices_yf.empty:
-        report += f"### 3.3. Precios Diarios (yfinance - Últimos {min(len(daily_prices_yf), DIAS_HISTORICOS)} Días)\n"
+    if daily_prices_yf is not None:
+        report += f"### 3.1. Precios Diarios (yfinance - Últimos {min(len(daily_prices_yf), DIAS_HISTORICOS)} datos)\n"
         report += daily_prices_yf.tail(DIAS_HISTORICOS).to_markdown() + "\n\n"
     else:
         report += "No se pudieron obtener los precios diarios de yfinance.\n"
 
-    # 4. Noticias Recientes
-    report += "## 4. Noticias Recientes y Eventos (Finnhub)\n"
-    if finnhub_news is not None and not finnhub_news.empty:
-        report += "### 4.1. Últimas Noticias de la Empresa\n"
-        cols_news = ['datetime', 'headline', 'source', 'url']
-        report += finnhub_news[cols_news].head(10).to_markdown(index=False) + "\n\n"
+    if daily_prices_pdr is not None:
+        report += f"### 3.2. Precios Diarios (pandas-datareader - Últimos {min(len(daily_prices_pdr), DIAS_HISTORICOS)} datos)\n"
+        report += daily_prices_pdr.tail(DIAS_HISTORICOS).to_markdown() + "\n\n"
     else:
-        report += f"No se pudieron obtener noticias recientes de Finnhub para {ticker}.\n"
+        report += "No se pudieron obtener los precios diarios desde pandas-datareader.\n"
+
+    if intraday_prices_yf is not None:
+        report += "### 3.3. Precios Intradía (yfinance)\n"
+        report += "_Intervalo 1h durante los últimos 5 días._\n"
+        report += intraday_prices_yf.tail(100).to_markdown() + "\n\n"
+    else:
+        report += "No se pudieron obtener los precios intradía de yfinance.\n"
+
+    # 4. Noticias Recientes
+    report += "## 4. Noticias Recientes y Eventos (yfinance)\n"
+    if news_df is not None and not news_df.empty:
+        columnas = [col for col in ["providerPublishTime", "title", "publisher", "link"] if col in news_df.columns]
+        if columnas:
+            report += news_df[columnas].head(10).to_markdown(index=False) + "\n\n"
+        else:
+            report += news_df.head(10).to_markdown(index=False) + "\n\n"
+    else:
+        report += f"No se encontraron noticias recientes para {ticker}.\n"
 
     report += "---\n\n"
     report += "_Análisis generado automáticamente. Los datos pueden variar según la disponibilidad de la API y los límites del plan._\n"
@@ -467,26 +470,28 @@ def procesar_ticker(ticker: str, cliente_id: str) -> Optional[str]:
         logger.info(f"   Ticker original: {ticker_original} -> Normalizado: {ticker}")
     
     try:
-        # 1. Obtener Datos Fundamentales (FMP)
-        profile = get_fmp_company_profile(ticker, FMP_API_KEY)
-        income_statement = get_fmp_financial_statements(ticker, FMP_API_KEY, 'income-statement')
-        balance_sheet = get_fmp_financial_statements(ticker, FMP_API_KEY, 'balance-sheet-statement')
-        cash_flow = get_fmp_financial_statements(ticker, FMP_API_KEY, 'cash-flow-statement')
+        ticker_obj = get_yf_ticker(ticker)
+        if ticker_obj is None:
+            logger.error(f"No se pudo inicializar yfinance para {ticker}")
+            return None
 
-        # 2. Obtener Datos de Precios (Alpha Vantage)
-        daily_prices_av = get_alpha_vantage_daily_prices(ticker, ALPHA_VANTAGE_API_KEY)
-        intraday_prices_av = get_alpha_vantage_intraday_prices(ticker, ALPHA_VANTAGE_API_KEY)
+        profile = get_yf_profile(ticker_obj)
+        estados_financieros = get_yf_financial_statements(ticker_obj)
+        daily_prices_yf = get_yf_daily_prices(ticker, FECHA_INICIO, FECHA_FIN)
+        daily_prices_pdr = get_pdr_daily_prices(ticker, FECHA_INICIO, FECHA_FIN)
+        intraday_prices_yf = get_yf_intraday_prices(ticker)
+        news_df = get_yf_news(ticker_obj)
 
-        # 3. Obtener Datos de Precios (yfinance)
-        daily_prices_yf = get_yfinance_historical_data(ticker, FECHA_INICIO, FECHA_FIN)
-
-        # 4. Obtener Noticias (Finnhub)
-        finnhub_news = get_finnhub_company_news(ticker, FINNHUB_API_KEY, FECHA_INICIO, FECHA_FIN)
-
-        # 5. Generar el informe
         report_content = generate_markdown_report(
-            ticker, profile, daily_prices_av, intraday_prices_av,
-            income_statement, balance_sheet, cash_flow, daily_prices_yf, finnhub_news
+            ticker,
+            profile,
+            estados_financieros.get("income"),
+            estados_financieros.get("balance"),
+            estados_financieros.get("cashflow"),
+            daily_prices_yf,
+            daily_prices_pdr,
+            intraday_prices_yf,
+            news_df,
         )
         
         logger.info(f"✅ Informe generado para {ticker}")
@@ -539,7 +544,7 @@ def procesar_cliente(cliente: Cliente, generar_consolidado: bool = True) -> Dict
         
         if report_content:
             # Guardar informe individual
-            nombre_archivo = f"{ticker}_analisis_financiero.md"
+            nombre_archivo = f"{sanitizar_nombre_archivo(ticker)}_analisis_financiero.md"
             success = subir_informe_cliente(report_content, nombre_archivo, cliente.user_id)
             
             if success:
@@ -566,18 +571,20 @@ def procesar_cliente(cliente: Cliente, generar_consolidado: bool = True) -> Dict
         print("\n📑 Generando informe consolidado...")
         consolidated_title = f"# Análisis Financiero Consolidado - Cliente: {cliente.nombre_completo}\n"
         consolidated_title += f"## User ID: {cliente.user_id}\n"
-        consolidated_title += f"## Portfolio: {', '.join([info['ticker'] for info in informes_generados])}\n"
+        tickers_lista = ', '.join([info['ticker'] for info in informes_generados])
+        consolidated_title += f"## Portfolio: {tickers_lista}\n"
         consolidated_title += f"## Generado el: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
-        final_report = consolidated_title + "\n\n<br><hr><br>\n\n".join([info['contenido'] for info in informes_generados])
-        
+
+        bloques = "\n\n<br><hr><br>\n\n".join([info['contenido'] for info in informes_generados])
+        final_report = consolidated_title + bloques
+
         nombre_consolidado = "informe_consolidado.md"
         success = subir_informe_cliente(final_report, nombre_consolidado, cliente.user_id)
-        
+
         if success:
-            print(f"✅ Informe consolidado guardado exitosamente")
+            print("✅ Informe consolidado guardado exitosamente")
         else:
-            print(f"❌ Error al guardar informe consolidado")
+            print("❌ Error al guardar informe consolidado")
     
     # Resumen final
     print("\n" + "="*80)

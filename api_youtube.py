@@ -1,124 +1,33 @@
-# 2.  **Obtener una clave de API de YouTube:** Si aún no la tienes, sigue los pasos que mencionaste:
-#     *   Ve a la [Consola de Google Cloud](https://console.cloud.google.com/).
-#     *   Crea un nuevo proyecto o selecciona uno existente.
-#     *   Habilita la API de Datos de YouTube v3 para tu proyecto.
-#     *   Crea credenciales (una clave de API).
-# 3.  **Reemplazar `"TU_CLAVE_DE_API"`** en el script con tu clave de API real.
-#
-# **Explicación del script:**
-#
-# *   Importa la biblioteca `googleapiclient.discovery`.
-# *   Define la función `buscar_video_reciente_en_canal` que encapsula la lógica de búsqueda.
-# *   Dentro de la función, se construye el objeto de servicio de YouTube utilizando tu clave de API.
-# *   Se crea la solicitud `youtube.search().list()` con los parámetros exactos que especificaste:
-#     *   `part="snippet"`: Para obtener la información básica.
-#     *   `channelId=channel_id`: Para restringir la búsqueda al canal especificado.
-#     *   `q=query`: Para buscar la cadena de texto en el título.
-#     *   `order="date"`: **Este es el parámetro clave para obtener el video más reciente.**
-#     *   `type="video"`: Para asegurar que solo se busquen videos.
-#     *   `maxResults=1`: Para obtener solo el primer resultado (el más reciente).
-# *   Se ejecuta la solicitud y se obtiene la respuesta.
-# *   Se verifica si la lista `items` en la respuesta no está vacía.
-# *   Si hay resultados, se extrae el `videoId` del primer elemento (que es el más reciente).
-# *   Se construye la URL completa del video utilizando el `videoId`.
-# *   La función devuelve la URL del video o `None` si no se encontraron resultados.
-# *   En la parte principal del script (`if __name__ == "__main__":`), se definen tu clave de API, el ID del canal de XTB y la consulta de búsqueda.
-# *   Se llama a la función `buscar_video_reciente_en_canal` con estos parámetros.
-# *   Finalmente, se imprime la URL del video encontrado o un mensaje indicando que no se encontró ninguno.
-#
-# Este script sigue exactamente los pasos que describiste para encontrar el video más reciente con el título específico en el canal de XTB LATAM.
+import datetime
+import time
+import unicodedata
+from typing import List, Optional, cast
 
 import googleapiclient.discovery
 import googleapiclient.errors
 import google.generativeai as genai
-import os
-import io
-import tempfile
-from supabase import create_client, Client
+
 from database import get_clientes_activos
 from storage_manager import StorageManager
 from config import (
-    YOUTUBE_API_KEY, GEMINI_API_KEY, 
-    SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE, SUPABASE_BUCKET_NAME, SUPABASE_BASE_PREFIX,
-    CHANNEL_ID_XTB, CONSULTA_BUSQUEDA,
-    validate_configuration
+    YOUTUBE_API_KEY,
+    GEMINI_API_KEY,
+    CHANNEL_ID_XTB,
+    CONSULTA_BUSQUEDA,
+    validate_configuration,
 )
 
-def buscar_video_reciente_en_canal(api_key, channel_id, query):
-    """
-    Busca el video más reciente en un canal específico de YouTube
-    que coincida con una consulta de búsqueda en el título.
 
-    Args:
-        api_key (str): Tu clave de API de YouTube.
-        channel_id (str): El ID del canal de YouTube donde buscar.
-        query (str): La cadena de texto a buscar en el título del video.
+GEMINI_MODEL = "gemini-2.5-flash"
+ARCHIVO_PREMERCADO = "informe_video_premercado.md"
+ARCHIVO_VISION_MERCADO = "vision de mercado.md"
 
-    Returns:
-        str or None: La URL del video más reciente encontrado, o None si no se encuentra ninguno.
-    """
-    api_service_name = "youtube"
-    api_version = "v3"
+VISION_SEMANAL_QUERY = "🌐 EN VIVO. VISIÓN semanal de MERCADOS"
+CIERRE_SEMANAL_QUERY = "🔒 EN VIVO. Cierre SEMANAL de los MERCADOS"
+VISION_SEMANAL_DIAS = {0, 4}  # lunes y viernes
 
-    try:
-        youtube = googleapiclient.discovery.build(
-            api_service_name, api_version, developerKey=api_key
-        )
-        
-        request = youtube.search().list(
-            part="snippet",
-            channelId=channel_id,
-            q=query,
-            order="date",
-            type="video",
-            maxResults=1,
-        )
-        response = request.execute()
 
-        # --- NUEVA VERIFICACIÓN DE ERRORES ---
-        # Revisa si la respuesta de la API contiene un objeto de error
-        if 'error' in response:
-            error_details = response['error']['errors'][0]
-            print("---------------------------------------------------------")
-            print("¡ERROR! La API de YouTube devolvió el siguiente mensaje:")
-            print(f"  Razón: {error_details.get('reason')}")
-            print(f"  Mensaje: {error_details.get('message')}")
-            print("---------------------------------------------------------")
-            return None
-
-        items = response.get("items", [])
-        if items:
-            video_id = items[0]["id"]["videoId"]
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-            return video_url
-        else:
-            return None
-
-    # Este bloque atrapará errores a nivel de HTTP (ej. 403 Forbidden)
-    except googleapiclient.errors.HttpError as e:
-        print("---------------------------------------------------------")
-        print(f"¡ERROR HTTP! No se pudo conectar con la API.")
-        print(f"Detalles: {e.reason} - {e.error_details}")
-        print("---------------------------------------------------------")
-        return None
-    except Exception as e:
-        print(f"Ocurrió un error inesperado en el script: {e}")
-        return None
-
-def analizar_video_con_gemini(gemini_api_key, video_url):
-    """
-    Analiza un video de YouTube usando Gemini 2.5-flash.
-    
-    Args:
-        gemini_api_key (str): Tu clave de API de Gemini.
-        video_url (str): La URL del video de YouTube a analizar.
-    
-    Returns:
-        str or None: El análisis del video generado por Gemini, o None si hay error.
-    """
-    
-    # Prompt especializado para análisis financiero de pre-mercado
-    prompt_analisis = """Eres un experto Analista Financiero de Pre-Mercado altamente cualificado y con una profunda comprensión de los mercados globales, la macroeconomía y los eventos noticiosos. Tu objetivo es procesar y analizar rigurosamente contenido audiovisual para derivar información accionable.
+PROMPT_PREMERCADO = """Eres un experto Analista Financiero de Pre-Mercado altamente cualificado y con una profunda comprensión de los mercados globales, la macroeconomía y los eventos noticiosos. Tu objetivo es procesar y analizar rigurosamente contenido audiovisual para derivar información accionable.
 
 Se te proporcionará un video (multimodal, incluyendo datos visuales y textuales) de análisis financiero de pre-mercado. Este video contendrá discusiones, gráficos (ej. velas, volumen, indicadores técnicos), tablas de datos, visualizaciones financieras y menciones de noticias. Tu tarea es interpretar este contenido como un experto en el dominio financiero, aprovechando la comprensión conjunta de texto y elementos visuales.
 
@@ -173,146 +82,351 @@ Entrega el informe en formato Markdown, estructurado con los siguientes encabeza
 
 Omite estrictamente cualquier información no relevante o superflua del video, como saludos iniciales o finales del presentador, comentarios personales ajenos al análisis, pausas, chistes, auto-promociones o cualquier contenido que no contribuya directamente al análisis financiero solicitado en el informe. Concéntrate únicamente en la información de valor para el informe y la comprensión del mercado."""
 
+
+PROMPT_VISION_SEMANAL = """Actúa como estratega jefe de mercados globales con foco en perspectivas semanales. Recibirás el video multimodal "Visión semanal de mercados" y debes construir un informe que integre visión macro, drivers sectoriales, riesgos y oportunidades tácticas.
+
+Redacta en Markdown utilizando esta estructura:
+
+# Visión Semanal de Mercados
+
+## Resumen Ejecutivo
+- Conecta los mensajes clave del video con el posicionamiento para la semana.
+
+## Tendencias Globales y Macroeconómicas
+- Identifica macro-temas y explica su impacto esperado.
+
+## Sectores y Activos Relevantes
+- Destaca activos, índices, divisas o commodities discutidos y su tesis operativa.
+
+## Catalizadores Próximos
+- Enumera eventos o publicaciones que se deben monitorear.
+
+## Estrategia Operativa
+- Señala oportunidades, riesgos y recomendaciones tácticas.
+
+Omite saludos o autopromoción del presentador y prioriza información accionable."""
+
+
+PROMPT_CIERRE_SEMANAL = """Eres un analista senior responsable del informe "Cierre semanal de los mercados". Debes sintetizar resultados de la semana, drivers que explican los movimientos y qué prepara el terreno para la próxima.
+
+Responde en Markdown con la siguiente estructura:
+
+# Cierre Semanal de Mercados
+
+## Resumen Numérico
+- Resume movimientos semanales clave (índices, divisas, commodities) mencionados.
+
+## Drivers Principales
+- Explica factores macro, corporativos o geopolíticos destacados.
+
+## Lecciones de la Semana
+- Lista aprendizajes o señales relevantes para la estrategia.
+
+## Repercusiones Futuras
+- Describe cómo los eventos de la semana condicionan la próxima.
+
+## Checklist para la Próxima Semana
+- Detalla elementos que el equipo debe vigilar.
+
+Sé directo, preciso y deja fuera cualquier comentario no financiero del presentador."""
+
+
+def limpiar_texto_busqueda(texto: str) -> str:
+    """Normaliza un texto eliminando signos y diacríticos para comparaciones flexibles."""
+    if not texto:
+        return ""
+
+    normalizado = unicodedata.normalize("NFKD", texto)
+    filtrado = "".join(
+        ch for ch in normalizado if ch.isalnum() or ch.isspace() or ch in ".-"
+    )
+    return " ".join(filtrado.lower().split())
+
+
+def buscar_video_reciente_en_canal(api_key: str, channel_id: str, query: str, max_results: int = 5) -> Optional[str]:
+    """Devuelve la URL del video más reciente que coincide con la búsqueda."""
+    api_service_name = "youtube"
+    api_version = "v3"
+
     try:
-        # Configurar la API key
-        genai.configure(api_key=gemini_api_key)
-        
+        youtube = googleapiclient.discovery.build(
+            api_service_name, api_version, developerKey=api_key
+        )
+
+        request = youtube.search().list(
+            part="snippet",
+            channelId=channel_id,
+            q=query,
+            order="date",
+            type="video",
+            maxResults=max(1, min(max_results, 50)),
+        )
+        response = request.execute()
+
+        if "error" in response:
+            error_details = response["error"]["errors"][0]
+            print("---------------------------------------------------------")
+            print("¡ERROR! La API de YouTube devolvió el siguiente mensaje:")
+            print(f"  Razón: {error_details.get('reason')}")
+            print(f"  Mensaje: {error_details.get('message')}")
+            print("---------------------------------------------------------")
+            return None
+
+        items = response.get("items", [])
+        if not items:
+            return None
+
+        criterio = limpiar_texto_busqueda(query)
+        for item in items:
+            titulo = item.get("snippet", {}).get("title", "")
+            titulo_limpio = limpiar_texto_busqueda(titulo)
+            if not criterio or criterio in titulo_limpio:
+                video_id = item["id"]["videoId"]
+                return f"https://www.youtube.com/watch?v={video_id}"
+
+        # Si ninguno coincide exactamente con el criterio, devolver el más reciente
+        video_id = items[0]["id"]["videoId"]
+        return f"https://www.youtube.com/watch?v={video_id}"
+        return None
+
+    except googleapiclient.errors.HttpError as e:
+        print("---------------------------------------------------------")
+        print("¡ERROR HTTP! No se pudo conectar con la API.")
+        print(f"Detalles: {e.reason} - {e.error_details}")
+        print("---------------------------------------------------------")
+        return None
+    except Exception as e:
+        print(f"Ocurrió un error inesperado en el script: {e}")
+        return None
+
+
+def buscar_video_reciente_con_fallback(api_key: str, channel_id: str, consultas: List[str]) -> Optional[str]:
+    """Intenta varias consultas hasta localizar un video."""
+    for idx, consulta in enumerate(consultas, start=1):
+        if not consulta:
+            continue
+        url = buscar_video_reciente_en_canal(api_key, channel_id, consulta)
+        if url:
+            if idx > 1:
+                print(
+                    f"⚠️  Video encontrado utilizando consulta alternativa '{consulta}'."
+                )
+            return url
+    return None
+
+
+def analizar_video_con_gemini(gemini_api_key: str, video_url: str, prompt: str) -> Optional[str]:
+    """Analiza un video de YouTube usando Gemini con el prompt indicado."""
+    try:
+        genai.configure(api_key=gemini_api_key)  # type: ignore[attr-defined]
+
         print("Enviando video a Gemini para análisis...")
         print("Esto puede tomar algunos minutos...")
-        
-        # Crear el modelo
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        
-        # Realizar la solicitud a Gemini
-        response = model.generate_content([video_url, prompt_analisis])
-        
+
+        model = genai.GenerativeModel(GEMINI_MODEL)  # type: ignore[attr-defined]
+        response = model.generate_content([video_url, prompt])
         return response.text
-        
+
     except Exception as e:
         print("---------------------------------------------------------")
-        print(f"¡ERROR! No se pudo analizar el video con Gemini.")
+        print("¡ERROR! No se pudo analizar el video con Gemini.")
         print(f"Detalles del error: {e}")
         print("---------------------------------------------------------")
         return None
 
-# --- Supabase helpers ---
-def existe_archivo_en_supabase(nombre_archivo_remoto):
-    """
-    DEPRECATED: Esta función ya no se utiliza.
-    Se mantiene por compatibilidad pero no debe usarse.
-    """
-    pass
+
+def esperar_intervalo(segundos: int, ultimo_intento: Optional[float]) -> None:
+    """Bloquea la ejecución hasta cumplir el intervalo deseado entre peticiones."""
+    if ultimo_intento is None:
+        return
+
+    restante = segundos - (time.time() - ultimo_intento)
+    if restante > 0:
+        print(f"Esperando {int(restante)} segundos antes del siguiente análisis...")
+        time.sleep(restante)
 
 
-def subir_texto_a_supabase(contenido_texto, nombre_archivo_remoto, cliente_id):
-    """
-    Sube contenido de texto a Supabase Storage en la carpeta del cliente.
-    
-    Args:
-        contenido_texto (str): Contenido a subir en formato texto.
-        nombre_archivo_remoto (str): Nombre del archivo remoto (sin carpeta).
-        cliente_id (str): ID del cliente para organización de archivos.
+def subir_informe_para_clientes(clientes, contenido: str, nombre_archivo: str) -> None:
+    """Sube el contenido dado al storage de Supabase para cada cliente activo."""
+    if not clientes:
+        print("⚠️  No se encontraron clientes activos en la base de datos. Se omite la subida.")
+        return
 
-    Returns:
-        bool: True si subió correctamente, False en caso contrario.
-    """
-    try:
-        storage = StorageManager()
-        success = storage.subir_texto(
-            contenido_texto=contenido_texto,
-            nombre_archivo=nombre_archivo_remoto,
-            cliente_id=cliente_id,
-            content_type="text/markdown; charset=utf-8"
-        )
-        return success
-    except Exception as e:
-        print("---------------------------------------------------------")
-        print("¡ERROR! No se pudo subir el archivo a Supabase.")
-        print(f"Detalles del error: {e}")
-        print("---------------------------------------------------------")
-        return False
-    except Exception as e:
-        print("---------------------------------------------------------")
-        print("¡ERROR! No se pudo subir el archivo a Supabase.")
-        print(f"Detalles del error: {e}")
-        print("---------------------------------------------------------")
-        return False
+    storage = StorageManager()
+    print(f"\n📊 Subiendo '{nombre_archivo}' para {len(clientes)} clientes activos...\n")
 
-# --- Configuración ---
-# Las claves API se cargan desde el archivo .env a través del módulo config
-# Las variables ya están cargadas desde el módulo config
-print("✅ Configuración cargada desde .env")
+    exitosos = 0
+    fallidos = 0
 
-# Validar configuración al inicio
-if not validate_configuration():
-    print("❌ Error: Configuración incompleta. Verifica tu archivo .env")
-    exit(1)
+    for idx, cliente in enumerate(clientes, 1):
+        print(f"[{idx}/{len(clientes)}] Subiendo para cliente: {cliente.nombre_completo} ({cliente.user_id})...")
+        try:
+            exito = storage.subir_texto(
+                contenido_texto=contenido,
+                nombre_archivo=nombre_archivo,
+                cliente_id=cliente.user_id,
+                content_type="text/markdown; charset=utf-8",
+            )
+        except Exception as err:
+            exito = False
+            print(f"    ❌ Error inesperado: {err}")
 
-# --- Ejecutar la búsqueda ---
-print("Buscando el video más reciente...")
-url_video_encontrado = buscar_video_reciente_en_canal(YOUTUBE_API_KEY, CHANNEL_ID_XTB, CONSULTA_BUSQUEDA)
-
-# --- Mostrar el resultado y analizar con Gemini ---
-if url_video_encontrado:
-    print(f"\nÉxito. Se encontró el video más reciente: {url_video_encontrado}")
-    
-    # Analizar el video con Gemini
-    print("\n" + "="*60)
-    print("INICIANDO ANÁLISIS CON GEMINI")
-    print("="*60)
-    
-    analisis_gemini = analizar_video_con_gemini(GEMINI_API_KEY, url_video_encontrado)
-    
-    if analisis_gemini:
-        print("\n" + "="*60)
-        print("ANÁLISIS FINANCIERO PRE-MERCADO COMPLETADO")
-        print("="*60)
-        print(analisis_gemini)
-
-        # Subir el informe a la carpeta de cada cliente activo
-        print("\n" + "="*60)
-        print("SUBIENDO INFORMES A SUPABASE STORAGE")
-        print("="*60)
-        
-        # Obtener todos los clientes activos
-        clientes = get_clientes_activos()
-        
-        if not clientes:
-            print("\n⚠️  No se encontraron clientes activos en la base de datos.")
-            print("El informe no se guardará.")
+        if exito:
+            exitosos += 1
+            print(f"    ✅ Subido exitosamente a carpeta: {cliente.user_id}/")
         else:
-            print(f"\n📊 Subiendo informe para {len(clientes)} clientes activos...\n")
-            
-            exitosos = 0
-            fallidos = 0
-            nombre_remoto = "informe_video_premercado.md"
-            
-            for idx, cliente in enumerate(clientes, 1):
-                print(f"[{idx}/{len(clientes)}] Subiendo para cliente: {cliente.nombre_completo}...")
-                
-                exito = subir_texto_a_supabase(
-                    contenido_texto=analisis_gemini,
-                    nombre_archivo_remoto=nombre_remoto,
-                    cliente_id=cliente.user_id
-                )
-                
-                if exito:
-                    exitosos += 1
-                    print(f"    ✅ Subido exitosamente a carpeta: {cliente.user_id}/")
-                else:
-                    fallidos += 1
-                    print(f"    ❌ Error al subir para cliente {cliente.user_id}")
-            
-            print("\n" + "="*60)
-            print("RESUMEN DE SUBIDA")
-            print("="*60)
-            print(f"✅ Exitosos: {exitosos}")
-            print(f"❌ Fallidos: {fallidos}")
-            print("="*60)
-        
+            fallidos += 1
+            print(f"    ❌ Error al subir para cliente {cliente.user_id}")
+
+    print("\n" + "=" * 60)
+    print("RESUMEN DE SUBIDA")
+    print("=" * 60)
+    print(f"✅ Exitosos: {exitosos}")
+    print(f"❌ Fallidos: {fallidos}")
+    print("=" * 60)
+
+
+def crear_informe_vision_mercado(resultados: List[dict]) -> str:
+    """Construye el Markdown consolidado para 'vision de mercado.md'."""
+    lineas: List[str] = ["# Informe Visión de Mercado", ""]
+
+    for indice, resultado in enumerate(resultados):
+        lineas.extend(
+            [
+                f"## {resultado['titulo']}",
+                f"- Video analizado: {resultado['url']}",
+                "",
+                resultado["analisis"].strip(),
+            ]
+        )
+
+        if indice < len(resultados) - 1:
+            lineas.extend(["", "---", ""])
+
+    return "\n".join(lineas).strip()
+
+
+def es_dia_vision_semanal(fecha: Optional[datetime.datetime] = None) -> bool:
+    """Determina si se debe procesar la visión semanal para la fecha dada."""
+    ref = fecha or datetime.datetime.now()
+    return ref.weekday() in VISION_SEMANAL_DIAS
+
+
+def main():
+    print("✅ Configuración cargada desde .env")
+
+    if not validate_configuration():
+        print("❌ Error: Configuración incompleta. Verifica tu archivo .env")
+        raise SystemExit(1)
+
+    clientes = get_clientes_activos()
+    ultimo_intento: Optional[float] = None
+
+    if YOUTUBE_API_KEY is None or CHANNEL_ID_XTB is None or GEMINI_API_KEY is None:
+        print("❌ Error: claves críticas no disponibles tras la validación.")
+        raise SystemExit(1)
+
+    youtube_key = cast(str, YOUTUBE_API_KEY)
+    channel_id = cast(str, CHANNEL_ID_XTB)
+    gemini_key = cast(str, GEMINI_API_KEY)
+    consulta_premercado = CONSULTA_BUSQUEDA or ""
+
+    if not consulta_premercado:
+        print("⚠️  CONSULTA_BUSQUEDA no está configurada. Se utilizará búsqueda vacía.")
+
+    print("Buscando el video de pre-mercado más reciente...")
+    url_premercado = buscar_video_reciente_en_canal(
+        youtube_key, channel_id, consulta_premercado
+    )
+
+    if url_premercado:
+        print(f"\nÉxito. Se encontró el video de pre-mercado: {url_premercado}")
+        print("\n" + "=" * 60)
+        print("INICIANDO ANÁLISIS DE PRE-MERCADO CON GEMINI")
+        print("=" * 60)
+
+        analisis_premercado = analizar_video_con_gemini(
+            gemini_key, url_premercado, PROMPT_PREMERCADO
+        )
+        ultimo_intento = time.time()
+
+        if analisis_premercado:
+            print("\n" + "=" * 60)
+            print("ANÁLISIS FINANCIERO PRE-MERCADO COMPLETADO")
+            print("=" * 60)
+            subir_informe_para_clientes(clientes, analisis_premercado, ARCHIVO_PREMERCADO)
+        else:
+            print("\nNo se pudo completar el análisis de pre-mercado con Gemini.")
     else:
-        print("\nNo se pudo completar el análisis con Gemini. Revisa tu clave API y conexión.")
-        
-else:
-    print(f"\nNo se encontró el video. Revisa el mensaje de error de la API de arriba.")
-    print("Asegúrate de que la API de YouTube v3 esté habilitada en tu proyecto de Google Cloud.")
+        print("\nNo se encontró el video de pre-mercado. Se omite el análisis diario.")
+
+    if not es_dia_vision_semanal():
+        print("\nHoy no corresponde procesar 'Visión de Mercado'.")
+        return
+
+    print("\n" + "=" * 60)
+    print("INICIANDO BLOQUE VISIÓN DE MERCADO")
+    print("=" * 60)
+
+    configuraciones_semana = [
+        {
+            "titulo": VISION_SEMANAL_QUERY,
+            "consultas": [
+                VISION_SEMANAL_QUERY,
+                "EN VIVO. VISIÓN semanal de los MERCADOS",
+                "VISIÓN semanal de MERCADOS",
+                "vision semanal mercados",
+            ],
+            "prompt": PROMPT_VISION_SEMANAL,
+        },
+        {
+            "titulo": CIERRE_SEMANAL_QUERY,
+            "consultas": [
+                CIERRE_SEMANAL_QUERY,
+                "EN VIVO. Cierre SEMANAL de los MERCADOS",
+                "Cierre SEMANAL de los MERCADOS",
+                "cierre semanal mercados",
+            ],
+            "prompt": PROMPT_CIERRE_SEMANAL,
+        },
+    ]
+
+    resultados: List[dict] = []
+
+    for indice, configuracion in enumerate(configuraciones_semana):
+        esperar_intervalo(30, ultimo_intento)
+
+        titulo = configuracion["titulo"]
+        print(f"\nBuscando el video '{titulo}'...")
+
+        url_video = buscar_video_reciente_con_fallback(
+            youtube_key, channel_id, configuracion["consultas"]
+        )
+
+        if not url_video:
+            print(f"⚠️  No se encontró un video coincidente para '{titulo}'.")
+            continue
+
+        print(f"Video localizado: {url_video}")
+        analisis = analizar_video_con_gemini(
+            gemini_key, url_video, configuracion["prompt"]
+        )
+        ultimo_intento = time.time()
+
+        if analisis:
+            resultados.append(
+                {"titulo": titulo, "url": url_video, "analisis": analisis}
+            )
+        else:
+            print(f"⚠️  No se pudo obtener el análisis de '{titulo}'.")
+
+    if not resultados:
+        print("\nNo se generaron análisis para 'Visión de Mercado'.")
+        return
+
+    informe_vision = crear_informe_vision_mercado(resultados)
+    subir_informe_para_clientes(clientes, informe_vision, ARCHIVO_VISION_MERCADO)
+
+
+if __name__ == "__main__":
+    main()
